@@ -3796,7 +3796,7 @@ dependencies = [
 
 [[package]]
 name = "rustatio"
-version = "0.1.0"
+version = "2.15.0"
 dependencies = [
  "async-trait",
  "env_logger",
@@ -3819,7 +3819,7 @@ dependencies = [
 
 [[package]]
 name = "rustatio-cli"
-version = "0.1.0"
+version = "2.15.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3840,7 +3840,7 @@ dependencies = [
 
 [[package]]
 name = "rustatio-core"
-version = "0.1.0"
+version = "2.15.0"
 dependencies = [
  "async-trait",
  "dirs 6.0.0",
@@ -3868,7 +3868,7 @@ dependencies = [
 
 [[package]]
 name = "rustatio-server"
-version = "0.1.0"
+version = "2.15.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3897,7 +3897,7 @@ dependencies = [
 
 [[package]]
 name = "rustatio-wasm"
-version = "0.1.0"
+version = "2.15.0"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
@@ -3911,7 +3911,7 @@ dependencies = [
 
 [[package]]
 name = "rustatio-watch"
-version = "0.1.0"
+version = "2.15.0"
 dependencies = [
  "async-trait",
  "hex",
