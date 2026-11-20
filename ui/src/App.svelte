@@ -1689,9 +1689,9 @@
                   selectedClientVersion={$activeInstance.selectedClientVersion}
                   port={$activeInstance.port}
                   currentForwardedPort={getForwardedPort(networkStatus)}
-                  vpnPortSyncVisible={isServerMode}
-                  networkStatusConfigured={isServerMode ? isNetworkConfigured(networkStatus) : true}
-                  vpnPortSyncEnabled={isServerMode ? getVpnPortSyncEnabled(networkStatus) : false}
+                  vpnPortSyncVisible={true}
+                  networkStatusConfigured={isNetworkConfigured(networkStatus)}
+                  vpnPortSyncEnabled={getVpnPortSyncEnabled(networkStatus)}
                   {networkStatusError}
                   vpnPortSync={$activeInstance.vpnPortSync}
                   uploadRate={$activeInstance.uploadRate}

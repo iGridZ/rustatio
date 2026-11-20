@@ -5,6 +5,7 @@ mod logging;
 mod persistence;
 mod scheduler;
 mod state;
+mod vpn;
 mod watch;
 #[cfg(test)]
 mod watch_tests;
@@ -271,6 +272,8 @@ fn main() {
         close_prompt_open: Arc::clone(&close_prompt_open),
         peer_listener: Arc::new(RwLock::new(None)),
         peer_listener_status: Arc::new(RwLock::new(PeerListenerStatus::default())),
+        forwarded_port: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+        vpn_status: Arc::new(RwLock::new(None)),
     };
 
     let should_exit_for_tray = Arc::clone(&should_exit);
@@ -425,6 +428,10 @@ fn main() {
                 // watch-folder deletions can update its loaded hashes.
                 scheduler::spawn(scheduler_state, app_handle);
             });
+
+            let state_for_vpn: tauri::State<'_, AppState> = app.state();
+            let state_for_vpn = state_for_vpn.inner().clone();
+            tauri::async_runtime::spawn(vpn::run(state_for_vpn));
 
             // Periodic auto-save every 30 seconds
             let state_for_save: tauri::State<'_, AppState> = app.state();

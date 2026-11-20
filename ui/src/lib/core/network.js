@@ -15,18 +15,6 @@ export function isNetworkConfigured(status) {
 }
 
 /**
- * Mask IP address for privacy (show first and last octets).
- */
-export function maskIp(ip) {
-  if (!ip) return '---';
-  const parts = ip.split('.');
-  if (parts.length === 4) {
-    return `${parts[0]}.***.***.${parts[3]}`;
-  }
-  return ip.substring(0, 8) + '...';
-}
-
-/**
  * Compact network label for the transfer rail.
  */
 export function getNetworkLabel(status) {
@@ -35,7 +23,7 @@ export function getNetworkLabel(status) {
     return { label: 'No VPN configured', tone: 'ratio' };
   }
   if (status.is_vpn) {
-    return { label: status.organization || 'VPN active', tone: 'upload' };
+    return { label: status.ip || status.organization || 'VPN active', tone: 'upload' };
   }
   return { label: 'No VPN', tone: 'ratio' };
 }

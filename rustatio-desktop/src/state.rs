@@ -1,12 +1,12 @@
 use rustatio_core::{
     primary_tracker_host, FakerConfig, FakerState, FakerStats, InstanceSummary,
-    PeerListenerService, PeerListenerStatus, ProxySettings, RatioFakerHandle, TorrentInfo,
-    TorrentSummary,
+    PeerListenerService, PeerListenerStatus, ProtonVpnStatus, ProxySettings, RatioFakerHandle,
+    TorrentInfo, TorrentSummary,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -98,12 +98,91 @@ pub struct AppState {
     pub close_prompt_open: Arc<AtomicBool>,
     pub peer_listener: Arc<RwLock<Option<PeerListenerHandle>>>,
     pub peer_listener_status: Arc<RwLock<PeerListenerStatus>>,
+    pub forwarded_port: Arc<AtomicU16>,
+    pub vpn_status: Arc<RwLock<Option<ProtonVpnStatus>>>,
 }
 
 impl AppState {
     pub async fn attach_peer_listener(&self, listener: PeerListenerHandle) {
         *self.peer_listener.write().await = Some(listener);
         self.refresh_peer_listener_port().await;
+    }
+
+    pub fn current_forwarded_port(&self) -> Option<u16> {
+        match self.forwarded_port.load(Ordering::Relaxed) {
+            0 => None,
+            port => Some(port),
+        }
+    }
+
+    fn set_current_forwarded_port(&self, port: Option<u16>) {
+        self.forwarded_port.store(port.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    pub async fn vpn_status(&self) -> Option<ProtonVpnStatus> {
+        *self.vpn_status.read().await
+    }
+
+    pub(crate) fn apply_forwarded_port_to_config(&self, config: &mut FakerConfig) {
+        if config.vpn_port_sync {
+            if let Some(port) = self.current_forwarded_port() {
+                config.port = port;
+            }
+        }
+    }
+
+    /// Applies a freshly detected `ProtonVPN` status: updates the stored IP/port and pushes
+    /// the forwarded port to every instance with `vpn_port_sync` enabled.
+    pub async fn apply_vpn_status(&self, status: Option<ProtonVpnStatus>) -> Result<usize, String> {
+        *self.vpn_status.write().await = status;
+        let Some(port) = status.and_then(|s| s.forwarded_port) else {
+            self.set_current_forwarded_port(None);
+            self.refresh_peer_listener_port().await;
+            return Ok(0);
+        };
+
+        if self.current_forwarded_port() == Some(port) {
+            return Ok(0);
+        }
+        self.set_current_forwarded_port(Some(port));
+
+        let mut fakers = self.fakers.write().await;
+        let mut updated = 0usize;
+
+        for instance in fakers.values_mut() {
+            if !instance.config.vpn_port_sync || instance.config.port == port {
+                continue;
+            }
+
+            let mut config = instance.config.clone();
+            config.port = port;
+
+            let state = instance.faker.stats_snapshot().state;
+            let is_running =
+                matches!(state, FakerState::Starting | FakerState::Running | FakerState::Paused);
+
+            if is_running {
+                instance.faker.set_runtime_port(port).await;
+            } else {
+                instance
+                    .faker
+                    .update_config(config.clone(), Some(self.http_client().await))
+                    .await
+                    .map_err(|e| format!("Failed to update synced port: {e}"))?;
+            }
+
+            instance.config = config;
+            updated += 1;
+        }
+
+        drop(fakers);
+        self.refresh_peer_listener_port().await;
+
+        if updated > 0 {
+            self.save_state().await.map_err(|e| format!("Failed to save synced port state: {e}"))?;
+        }
+
+        Ok(updated)
     }
 
     pub async fn set_peer_listener_status(&self, status: PeerListenerStatus) {
@@ -161,21 +240,40 @@ impl AppState {
 
     async fn desired_peer_port_from_instances(&self) -> Result<Option<u16>, String> {
         let fakers = self.fakers.read().await;
-        let mut ports = BTreeSet::new();
+        let mut manual_ports = BTreeSet::new();
+        let mut has_synced_active = false;
 
         for instance in fakers.values() {
             let state = instance.faker.stats_snapshot().state;
             if matches!(state, FakerState::Starting | FakerState::Running | FakerState::Paused) {
-                ports.insert(instance.config.port);
+                if instance.config.vpn_port_sync {
+                    has_synced_active = true;
+                } else {
+                    manual_ports.insert(instance.config.port);
+                }
             }
         }
 
-        match ports.len() {
+        if has_synced_active {
+            if let Some(port) = self.current_forwarded_port() {
+                if manual_ports.is_empty() {
+                    return Ok(Some(port));
+                }
+
+                return Err(format!(
+                    "multiple active peer ports configured: {}, {}",
+                    port,
+                    manual_ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+
+        match manual_ports.len() {
             0 => Ok(None),
-            1 => Ok(ports.iter().next().copied()),
+            1 => Ok(manual_ports.iter().next().copied()),
             _ => Err(format!(
                 "multiple active peer ports configured: {}",
-                ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
+                manual_ports.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
             )),
         }
     }
@@ -302,8 +400,10 @@ impl AppState {
     pub async fn apply_instance_config(
         &self,
         instance_id: u32,
-        config: FakerConfig,
+        mut config: FakerConfig,
     ) -> Result<(), String> {
+        self.apply_forwarded_port_to_config(&mut config);
+
         let old_config = {
             let mut fakers = self.fakers.write().await;
             let instance = fakers
@@ -368,12 +468,13 @@ mod tests {
     use crate::persistence;
     use crate::state::{AppState, FakerInstance, InstanceInfo};
     use rustatio_core::{
-        AppConfig, FakerConfig, PeerListenerStatus, ProxySettings, RatioFaker, RatioFakerHandle,
-        TorrentInfo,
+        AppConfig, FakerConfig, FakerState, PeerListenerStatus, ProtonVpnStatus, ProxySettings,
+        RatioFaker, RatioFakerHandle, TorrentInfo,
     };
     use rustatio_watch::InstanceSource;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicBool;
+    use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicBool, AtomicU16};
     use std::sync::{Arc, OnceLock};
     use tokio::sync::{Mutex, RwLock};
 
@@ -414,6 +515,8 @@ mod tests {
             close_prompt_open: Arc::new(AtomicBool::new(false)),
             peer_listener: Arc::new(RwLock::new(None)),
             peer_listener_status: Arc::new(RwLock::new(PeerListenerStatus::default())),
+            forwarded_port: Arc::new(AtomicU16::new(0)),
+            vpn_status: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -440,6 +543,195 @@ mod tests {
                 source: InstanceSource::WatchFolder,
             },
         );
+    }
+
+    async fn set_instance_state(state: &AppState, id: u32, faker_state: FakerState) {
+        let fakers = state.fakers.read().await;
+        let instance = fakers.get(&id);
+        assert!(instance.is_some());
+        if let Some(instance) = instance {
+            let mut stats = instance.faker.stats_snapshot();
+            stats.state = faker_state;
+            instance.faker.restore_snapshot(stats).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_vpn_status_updates_only_synced_instances() {
+        let _guard = state_path_test_lock().lock().await;
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let temp = temp.unwrap_or_else(|_| unreachable!());
+        persistence::set_test_state_file_path(Some(temp.path().join("desktop-state.json")));
+
+        let state = app_state();
+        insert_instance(
+            &state,
+            1,
+            FakerConfig { vpn_port_sync: true, port: 6881, ..FakerConfig::default() },
+        )
+        .await;
+        insert_instance(
+            &state,
+            2,
+            FakerConfig { vpn_port_sync: false, port: 60000, ..FakerConfig::default() },
+        )
+        .await;
+
+        let updated = state
+            .apply_vpn_status(Some(ProtonVpnStatus {
+                external_ip: Ipv4Addr::new(1, 2, 3, 4),
+                forwarded_port: Some(51413),
+            }))
+            .await;
+        assert!(updated.is_ok());
+        assert_eq!(updated.unwrap_or_default(), 1);
+
+        assert_eq!(state.current_forwarded_port(), Some(51413));
+        let fakers = state.fakers.read().await;
+        assert_eq!(fakers.get(&1).map(|inst| inst.config.port), Some(51413));
+        assert_eq!(fakers.get(&2).map(|inst| inst.config.port), Some(60000));
+        drop(fakers);
+
+        persistence::set_test_state_file_path(None);
+    }
+
+    #[tokio::test]
+    async fn apply_vpn_status_updates_running_instance_port_immediately() {
+        let _guard = state_path_test_lock().lock().await;
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let temp = temp.unwrap_or_else(|_| unreachable!());
+        persistence::set_test_state_file_path(Some(temp.path().join("desktop-state.json")));
+
+        let state = app_state();
+        insert_instance(
+            &state,
+            1,
+            FakerConfig { vpn_port_sync: true, port: 40000, ..FakerConfig::default() },
+        )
+        .await;
+        set_instance_state(&state, 1, FakerState::Running).await;
+
+        let updated = state
+            .apply_vpn_status(Some(ProtonVpnStatus {
+                external_ip: Ipv4Addr::new(1, 2, 3, 4),
+                forwarded_port: Some(51413),
+            }))
+            .await;
+        assert!(updated.is_ok());
+        assert_eq!(updated.unwrap_or_default(), 1);
+
+        let fakers = state.fakers.read().await;
+        assert_eq!(fakers.get(&1).map(|inst| inst.config.port), Some(51413));
+        drop(fakers);
+
+        persistence::set_test_state_file_path(None);
+    }
+
+    #[tokio::test]
+    async fn apply_vpn_status_clears_port_when_disconnected() {
+        let _guard = state_path_test_lock().lock().await;
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let temp = temp.unwrap_or_else(|_| unreachable!());
+        persistence::set_test_state_file_path(Some(temp.path().join("desktop-state.json")));
+
+        let state = app_state();
+        insert_instance(
+            &state,
+            1,
+            FakerConfig { vpn_port_sync: true, port: 40000, ..FakerConfig::default() },
+        )
+        .await;
+
+        let updated = state
+            .apply_vpn_status(Some(ProtonVpnStatus {
+                external_ip: Ipv4Addr::new(1, 2, 3, 4),
+                forwarded_port: Some(51413),
+            }))
+            .await;
+        assert!(updated.is_ok());
+        assert_eq!(state.current_forwarded_port(), Some(51413));
+
+        let cleared = state.apply_vpn_status(None).await;
+        assert!(cleared.is_ok());
+        assert_eq!(state.current_forwarded_port(), None);
+        assert!(state.vpn_status().await.is_none());
+
+        persistence::set_test_state_file_path(None);
+    }
+
+    #[tokio::test]
+    async fn apply_instance_config_uses_forwarded_port_when_sync_enabled() {
+        let _guard = state_path_test_lock().lock().await;
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let temp = temp.unwrap_or_else(|_| unreachable!());
+        persistence::set_test_state_file_path(Some(temp.path().join("desktop-state.json")));
+
+        let state = app_state();
+        insert_instance(&state, 1, FakerConfig::default()).await;
+
+        let applied = state
+            .apply_vpn_status(Some(ProtonVpnStatus {
+                external_ip: Ipv4Addr::new(1, 2, 3, 4),
+                forwarded_port: Some(51413),
+            }))
+            .await;
+        assert!(applied.is_ok());
+
+        let updated = state
+            .apply_instance_config(
+                1,
+                FakerConfig { vpn_port_sync: true, port: 6881, ..FakerConfig::default() },
+            )
+            .await;
+        assert!(updated.is_ok());
+
+        let fakers = state.fakers.read().await;
+        assert_eq!(fakers.get(&1).map(|inst| inst.config.port), Some(51413));
+        drop(fakers);
+
+        persistence::set_test_state_file_path(None);
+    }
+
+    #[tokio::test]
+    async fn refresh_peer_listener_port_errors_on_synced_and_manual_port_clash() {
+        let _guard = state_path_test_lock().lock().await;
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let temp = temp.unwrap_or_else(|_| unreachable!());
+        persistence::set_test_state_file_path(Some(temp.path().join("desktop-state.json")));
+
+        let state = app_state();
+        insert_instance(
+            &state,
+            1,
+            FakerConfig { vpn_port_sync: true, port: 6881, ..FakerConfig::default() },
+        )
+        .await;
+        insert_instance(
+            &state,
+            2,
+            FakerConfig { vpn_port_sync: false, port: 60000, ..FakerConfig::default() },
+        )
+        .await;
+        set_instance_state(&state, 1, FakerState::Running).await;
+        set_instance_state(&state, 2, FakerState::Running).await;
+
+        let applied = state
+            .apply_vpn_status(Some(ProtonVpnStatus {
+                external_ip: Ipv4Addr::new(1, 2, 3, 4),
+                forwarded_port: Some(51413),
+            }))
+            .await;
+        assert!(applied.is_ok());
+
+        let desired = state.desired_peer_port_from_instances().await;
+        assert!(desired.is_err());
+
+        persistence::set_test_state_file_path(None);
     }
 
     #[tokio::test]

@@ -79,6 +79,14 @@ pub fn cancel_close_prompt(app: tauri::AppHandle) {
 
 #[derive(Serialize)]
 pub struct DesktopNetworkStatus {
+    /// Always `true`: `ProtonVPN` NAT-PMP detection is built in and always running on
+    /// desktop, unlike the server's Gluetun-dependent detection. `is_vpn` carries the
+    /// live connected/disconnected state instead.
+    configured: bool,
+    ip: String,
+    is_vpn: bool,
+    forwarded_port: Option<u16>,
+    vpn_port_sync_enabled: bool,
     #[serde(rename = "peer_listener_port")]
     port: Option<u16>,
     #[serde(rename = "peer_listener_active")]
@@ -97,7 +105,13 @@ pub async fn get_network_status(
 ) -> Result<DesktopNetworkStatus, String> {
     let status = state.peer_listener_status().await;
     let proxy = state.proxy_settings().await;
+    let vpn_status = state.vpn_status().await;
     Ok(DesktopNetworkStatus {
+        configured: true,
+        ip: vpn_status.map(|s| s.external_ip.to_string()).unwrap_or_default(),
+        is_vpn: vpn_status.is_some(),
+        forwarded_port: state.current_forwarded_port(),
+        vpn_port_sync_enabled: true,
         port: status.bound_port,
         active: status.bound_port.is_some(),
         error: status.last_error,

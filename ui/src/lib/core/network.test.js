@@ -8,7 +8,6 @@ import {
   getPeerListenerPort,
   getProxyStatus,
   isNetworkConfigured,
-  maskIp,
 } from './network.js';
 
 test('network getters support snake_case and camelCase payloads', () => {
@@ -27,16 +26,14 @@ test('isNetworkConfigured treats only explicit false as unconfigured', () => {
   assert.equal(isNetworkConfigured(null), true);
 });
 
-test('maskIp hides middle octets and truncates other formats', () => {
-  assert.equal(maskIp('149.34.12.215'), '149.***.***.215');
-  assert.equal(maskIp('2001:db8::1'), '2001:db8...');
-  assert.equal(maskIp(''), '---');
-});
-
 test('getNetworkLabel maps VPN states to rail labels', () => {
   assert.deepEqual(getNetworkLabel({ configured: false }), {
     label: 'No VPN configured',
     tone: 'ratio',
+  });
+  assert.deepEqual(getNetworkLabel({ is_vpn: true, ip: '149.34.12.215' }), {
+    label: '149.34.12.215',
+    tone: 'upload',
   });
   assert.deepEqual(getNetworkLabel({ is_vpn: true, organization: 'Datacamp' }), {
     label: 'Datacamp',

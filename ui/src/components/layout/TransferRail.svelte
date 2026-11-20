@@ -1,5 +1,5 @@
 <script>
-  import { getForwardedPort, getNetworkLabel, getProxyStatus, maskIp } from '$lib/core/network.js';
+  import { getForwardedPort, getNetworkLabel, getProxyStatus } from '$lib/core/network.js';
   import { formatBytes, formatRate } from '$lib/core/format.js';
   import {
     Loader2,
@@ -129,9 +129,6 @@
             ? 'text-stat-upload'
             : 'text-stat-ratio'}">{network.label}</span
         >
-        {#if networkStatus?.ip}
-          <span class="tabular-nums hidden xl:inline">{maskIp(networkStatus.ip)}</span>
-        {/if}
         {#if forwardedPort}
           <span class="hidden items-center gap-1 xl:flex text-muted-foreground">
             <PlugZap size={10} class="text-stat-upload" />
