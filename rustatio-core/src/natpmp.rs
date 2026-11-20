@@ -19,7 +19,7 @@ const NATPMP_PORT: u16 = 5351;
 const MAP_LIFETIME_SECS: u32 = 60;
 
 const OP_EXTERNAL_ADDRESS: u8 = 0;
-const OP_MAP_TCP: u8 = 2;
+const OP_MAP_UDP: u8 = 1;
 
 const EXTERNAL_ADDRESS_RESPONSE_LEN: usize = 12;
 const MAP_PORT_RESPONSE_LEN: usize = 16;
@@ -29,7 +29,9 @@ const MAP_PORT_RESPONSE_LEN: usize = 16;
 pub struct ProtonVpnStatus {
     /// The tunnel's external (public) IPv4 address.
     pub external_ip: Ipv4Addr,
-    /// The TCP port currently forwarded to this session, if Port Forwarding is enabled.
+    /// The port currently forwarded to this session, if Port Forwarding is enabled. Proton
+    /// maintains a single account-level mapping shared by TCP and UDP, so this port is used
+    /// for both regardless of which protocol opcode queried it.
     pub forwarded_port: Option<u16>,
 }
 
@@ -64,7 +66,7 @@ async fn detect_protonvpn_at(
 ) -> Option<ProtonVpnStatus> {
     let external_ip = query_external_address(gateway, request_timeout).await.ok()?;
     let forwarded_port =
-        query_tcp_port_mapping(gateway, request_timeout).await.ok().filter(|port| *port > 0);
+        query_udp_port_mapping(gateway, request_timeout).await.ok().filter(|port| *port > 0);
 
     Some(ProtonVpnStatus { external_ip, forwarded_port })
 }
@@ -112,12 +114,15 @@ async fn query_external_address(
     Ok(Ipv4Addr::new(response[8], response[9], response[10], response[11]))
 }
 
-async fn query_tcp_port_mapping(
+async fn query_udp_port_mapping(
     gateway: SocketAddrV4,
     request_timeout: Duration,
 ) -> Result<u16, NatPmpError> {
+    // Proton's own app negotiates its single port-forwarding mapping over the UDP opcode;
+    // querying with the TCP opcode instead asks the gateway for an unrelated, brand-new
+    // mapping and returns a different port than the one shown in the ProtonVPN app.
     let mut request = [0u8; 12];
-    request[1] = OP_MAP_TCP;
+    request[1] = OP_MAP_UDP;
     request[4..6].copy_from_slice(&1u16.to_be_bytes()); // internal port placeholder; Proton's gateway ignores it
     request[6..8].copy_from_slice(&0u16.to_be_bytes()); // suggested external port: any (reads the existing mapping)
     request[8..12].copy_from_slice(&MAP_LIFETIME_SECS.to_be_bytes());
@@ -160,9 +165,9 @@ mod tests {
                         resp[8..12].copy_from_slice(&external_ip.octets());
                         resp
                     }
-                    OP_MAP_TCP => {
+                    OP_MAP_UDP => {
                         let mut resp = vec![0u8; MAP_PORT_RESPONSE_LEN];
-                        resp[1] = 128 + OP_MAP_TCP;
+                        resp[1] = 128 + OP_MAP_UDP;
                         resp[10..12].copy_from_slice(&mapped_port.to_be_bytes());
                         resp
                     }
