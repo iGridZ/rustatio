@@ -20,7 +20,7 @@ pub use faker::{
 };
 pub use grid::{primary_tracker_host, GridImportSettings, GridMode, InstanceSummary};
 #[cfg(not(target_arch = "wasm32"))]
-pub use natpmp::{detect_protonvpn, ProtonVpnStatus, PROTONVPN_GATEWAY};
+pub use natpmp::{detect_protonvpn, read_forwarded_port_from_log, ProtonVpnStatus, PROTONVPN_GATEWAY};
 #[cfg(not(target_arch = "wasm32"))]
 pub use peer_listener::{PeerCatalog, PeerListenerService, PeerListenerStatus, PeerLookup};
 pub use proxy::ProxySettings;

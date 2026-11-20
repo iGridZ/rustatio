@@ -62,7 +62,7 @@ async fn detect_protonvpn_at(
     request_timeout: Duration,
 ) -> Option<ProtonVpnStatus> {
     let external_ip = query_external_address(gateway, request_timeout).await.ok()?;
-    let forwarded_port = read_forwarded_port_from_log();
+    let forwarded_port = read_forwarded_port_from_log().ok().flatten();
 
     Some(ProtonVpnStatus { external_ip, forwarded_port })
 }
@@ -92,15 +92,69 @@ async fn query_external_address(
     Ok(Ipv4Addr::new(buf[8], buf[9], buf[10], buf[11]))
 }
 
+fn protonvpn_log_path() -> Option<std::path::PathBuf> {
+    Some(dirs::data_local_dir()?.join("Proton").join("ProtonVPN").join("Logs").join("client-logs.txt"))
+}
+
 /// Reads the most recent forwarded port the `ProtonVPN` app logged for this session.
 ///
 /// `ProtonVPN` logs lines like:
 /// `... Received PortForwarding Status 'SleepingUntilRefresh' ..., Port pair 47055->47055, ...`
-fn read_forwarded_port_from_log() -> Option<u16> {
-    let log_path =
-        dirs::data_local_dir()?.join("Proton").join("ProtonVPN").join("Logs").join("client-logs.txt");
-    let content = std::fs::read_to_string(log_path).ok()?;
-    content.lines().rev().find_map(parse_port_pair_line)
+///
+/// Returns `Err` (with a reason suitable for logging) when the log can't be located or
+/// read at all - as opposed to `Ok(None)`, which means the log was read fine but doesn't
+/// currently show an active port mapping.
+pub fn read_forwarded_port_from_log() -> Result<Option<u16>, String> {
+    let path = protonvpn_log_path().ok_or("could not determine the local app data directory")?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let content = decode_log_bytes(&bytes)
+        .ok_or_else(|| format!("{} is not valid UTF-8 or UTF-16 text", path.display()))?;
+
+    Ok(content.lines().rev().find_map(parse_port_pair_line))
+}
+
+/// `ProtonVPN`'s log file is normally UTF-8, but Windows/.NET loggers sometimes write
+/// UTF-16 instead - with or without a byte-order mark. Plain-ASCII UTF-16 is *also*
+/// technically valid UTF-8 byte-for-byte (every ASCII character is followed by a null
+/// byte, both of which are valid lone UTF-8 code points), so a naive "try UTF-8 first"
+/// check never catches it; detect UTF-16-without-BOM by its telltale alternating-null
+/// pattern before falling back to UTF-8.
+fn decode_log_bytes(bytes: &[u8]) -> Option<String> {
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return decode_utf16(rest, u16::from_le_bytes);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return decode_utf16(rest, u16::from_be_bytes);
+    }
+    if looks_like_utf16le_without_bom(bytes) {
+        return decode_utf16(bytes, u16::from_le_bytes);
+    }
+
+    std::str::from_utf8(bytes).ok().map(str::to_string)
+}
+
+/// Heuristic for UTF-16LE text with no BOM: for mostly-ASCII content, every other byte
+/// (the high byte of each UTF-16 code unit) is zero.
+fn looks_like_utf16le_without_bom(bytes: &[u8]) -> bool {
+    if bytes.len() < 8 || !bytes.len().is_multiple_of(2) {
+        return false;
+    }
+
+    let sample = &bytes[..bytes.len().min(512)];
+    let high_bytes = sample.iter().skip(1).step_by(2);
+    let total = high_bytes.clone().count();
+    let zero = high_bytes.filter(|&&b| b == 0).count();
+
+    total > 0 && zero * 10 >= total * 9
+}
+
+fn decode_utf16(bytes: &[u8], from_bytes: fn([u8; 2]) -> u16) -> Option<String> {
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+
+    let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|pair| from_bytes([pair[0], pair[1]])).collect();
+    String::from_utf16(&units).ok()
 }
 
 fn parse_port_pair_line(line: &str) -> Option<u16> {
@@ -189,5 +243,41 @@ line three, Port pair 47055->47055, expiring in 00:01:00";
 
         let last_match = log.lines().rev().find_map(parse_port_pair_line);
         assert_eq!(last_match, Some(47055));
+    }
+
+    #[test]
+    fn decode_log_bytes_handles_utf8() {
+        let text = "Port pair 47055->47055";
+        assert_eq!(decode_log_bytes(text.as_bytes()).as_deref(), Some(text));
+    }
+
+    #[test]
+    fn decode_log_bytes_handles_utf16_le_with_bom() {
+        let text = "Port pair 47055->47055";
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+
+        assert_eq!(decode_log_bytes(&bytes).as_deref(), Some(text));
+    }
+
+    #[test]
+    fn decode_log_bytes_handles_utf16_le_without_bom() {
+        let text = "Port pair 47055->47055";
+        let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+
+        assert_eq!(decode_log_bytes(&bytes).as_deref(), Some(text));
+    }
+
+    #[test]
+    fn decode_log_bytes_handles_utf16_be_with_bom() {
+        let text = "Port pair 47055->47055";
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+
+        assert_eq!(decode_log_bytes(&bytes).as_deref(), Some(text));
     }
 }

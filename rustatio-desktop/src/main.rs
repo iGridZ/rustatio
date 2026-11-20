@@ -431,7 +431,8 @@ fn main() {
 
             let state_for_vpn: tauri::State<'_, AppState> = app.state();
             let state_for_vpn = state_for_vpn.inner().clone();
-            tauri::async_runtime::spawn(vpn::run(state_for_vpn));
+            let app_handle_for_vpn = app.handle().clone();
+            tauri::async_runtime::spawn(vpn::run(app_handle_for_vpn, state_for_vpn));
 
             // Periodic auto-save every 30 seconds
             let state_for_save: tauri::State<'_, AppState> = app.state();
